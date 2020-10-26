@@ -1,5 +1,6 @@
 use std::io;
 use std::vec::*;
+use std::boxed::*;
 use std::net::TcpStream;
 use std::io::prelude::*;
 use std::os::unix::io::{AsRawFd};
@@ -44,7 +45,61 @@ fn proxy_io(src: &mut ssh2::Stream, dst: &mut dyn io::Write) {
 }
 
 
-fn run(sess: &ssh2::Session, command: &str) -> Result<i32, ssh2::Error> {
+struct PrefixWriter {
+    base: Box<dyn io::Write>,
+    prefix: String,
+    // On the first write, we need to add a prefix and remember we did...
+    initially_prefixed: bool,
+    // We add a prefix on every new line, so *after* a \n, but we can't
+    // add it until we see another byte if we don't want to create
+    // a trailing line with only a prefix. But we might only see the
+    // \n in this call to `write`, so we need to keep track of the
+    // \n we saw here.
+    do_prefix: bool,
+}
+
+
+impl io::Write for PrefixWriter {
+
+    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+        let mut size: usize = 0;
+        if ! self.initially_prefixed {
+            self.base.write(self.prefix.as_bytes())?;
+            self.initially_prefixed = true;
+        }
+
+        for c in buf {
+            if self.do_prefix {
+                self.base.write(self.prefix.as_bytes())?;
+                self.do_prefix = false;
+            }
+            if *c == '\n' as u8 {
+                self.do_prefix = true;
+            }
+            size += self.base.write(&[*c])?;
+        }
+        return Ok(size);
+    }
+
+    fn flush(&mut self) -> Result<(), io::Error> {
+        return self.base.flush();
+    }
+}
+
+
+impl PrefixWriter {
+    fn new(base: Box<dyn io::Write>, prefix: String) -> PrefixWriter {
+        PrefixWriter {
+            base: base,
+            prefix: prefix,
+            initially_prefixed: false,
+            do_prefix: false,
+        }
+    }
+}
+
+
+fn run(sess: &ssh2::Session, command: &str, mut stdout: &mut dyn io::Write, mut stderr: &mut dyn io::Write) -> Result<i32, ssh2::Error> {
     let mut channel = sess.channel_session()?;
     channel.exec(&command)?;
 
@@ -56,16 +111,14 @@ fn run(sess: &ssh2::Session, command: &str) -> Result<i32, ssh2::Error> {
         revents: 0,
     }];
 
-    let mut stdout_dst = io::stdout();
     let mut stdout_src = channel.stream(0);
-    let mut stderr_dst = io::stderr();
     let mut stderr_src = channel.stderr();
 
     loop {
         filedescriptor::poll(&mut pfd, None).ok();
 
-        proxy_io(&mut stdout_src, &mut stdout_dst);
-        proxy_io(&mut stderr_src, &mut stderr_dst);
+        proxy_io(&mut stdout_src, &mut stdout);
+        proxy_io(&mut stderr_src, &mut stderr);
 
         if channel.eof() {
             break;
@@ -88,11 +141,12 @@ fn connect(host: &str, port: u32) -> Result<ssh2::Session, ssh2::Error> {
 
 
 fn run_task(task: Task) -> Result<(), ssh2::Error> {
-    println!("Starting on {}", task.host);
+    let prefix = String::from(format!("[{}]: ", task.host));
+    let mut stdout = PrefixWriter::new(Box::new(io::stdout()), prefix.clone());
+    let mut stderr = PrefixWriter::new(Box::new(io::stderr()), prefix.clone());
     let sess = connect(&task.host, task.port).unwrap();
     assert!(auth(&task.host, &task.user, &sess).unwrap());
-    run(&sess, &task.command).unwrap();
-    println!("Finished on {}", task.host);
+    run(&sess, &task.command, &mut stdout, &mut stderr).unwrap();
     return Ok(());
 }
 
