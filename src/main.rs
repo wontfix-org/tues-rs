@@ -36,7 +36,7 @@ fn proxy_io(src: &mut ssh2::Stream, dst: &mut dyn io::Write) {
             if size == 0 {
                 return;
             } else {
-                dst.write_all(&buf).unwrap();
+                dst.write_all(&buf[..size]).unwrap();
             }
         }
         Err(_) => return,
