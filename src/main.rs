@@ -152,11 +152,11 @@ fn run_task(task: Task) -> Result<(), ssh2::Error> {
 
 
 #[derive(Debug, Clone)]
-struct Task {
-    login_user: String,
+struct Task<'a> {
+    login_user: &'a str,
     port: u32,
-    host: String,
-    command: String,
+    host: &'a str,
+    command: &'a str,
 }
 
 
@@ -214,10 +214,10 @@ fn main() {
     let tasks: Vec<Task> = hosts.iter().map(
         |host| -> Task {
             return Task {
-                login_user: opts.login_user.clone(),
+                login_user: &opts.login_user,
                 port: opts.port,
-                host: host.clone(),
-                command: opts.command.clone(),
+                host: &host,
+                command: &opts.command,
             };
         },
     ).collect();
