@@ -15,13 +15,13 @@ extern crate filedescriptor;
 extern crate task_queue;
 
 
-fn auth(host: &str, user: &str, sess: &ssh2::Session) -> Result<bool, ssh2::Error> {
-    match sess.userauth_agent(&user) {
+fn auth(host: &str, login_user: &str, sess: &ssh2::Session) -> Result<bool, ssh2::Error> {
+    match sess.userauth_agent(&login_user) {
         Ok(v) => v,
         Err(_) => {
             sess.userauth_password(
-                user,
-                &rpassword::read_password_from_tty(Some(&format!("{}@{}'s password: ", user, host))).unwrap(),
+                login_user,
+                &rpassword::read_password_from_tty(Some(&format!("{}@{}'s password: ", login_user, host))).unwrap(),
             )?;
         },
     }
@@ -145,7 +145,7 @@ fn run_task(task: Task) -> Result<(), ssh2::Error> {
     let mut stdout = PrefixWriter::new(Box::new(io::stdout()), prefix.clone());
     let mut stderr = PrefixWriter::new(Box::new(io::stderr()), prefix.clone());
     let sess = connect(&task.host, task.port).unwrap();
-    assert!(auth(&task.host, &task.user, &sess).unwrap());
+    assert!(auth(&task.host, &task.login_user, &sess).unwrap());
     run(&sess, &task.command, &mut stdout, &mut stderr).unwrap();
     return Ok(());
 }
@@ -153,7 +153,7 @@ fn run_task(task: Task) -> Result<(), ssh2::Error> {
 
 #[derive(Debug, Clone)]
 struct Task {
-    user: String,
+    login_user: String,
     port: u32,
     host: String,
     command: String,
@@ -194,7 +194,7 @@ fn main() {
         opt parallel:bool, desc:"Run multiple commands in parallel";
         opt num_threads:usize=10,
             desc:"Number of concurrent threads to use for parallel execution";
-        opt user:String=whoami::username(),
+        opt login_user:String=whoami::username(),
             desc:"Default username to connect with";
         opt port:u32=22,
             desc:"Default port to connect to";
@@ -214,7 +214,7 @@ fn main() {
     let tasks: Vec<Task> = hosts.iter().map(
         |host| -> Task {
             return Task {
-                user: opts.user.clone(),
+                login_user: opts.login_user.clone(),
                 port: opts.port,
                 host: host.clone(),
                 command: opts.command.clone(),
