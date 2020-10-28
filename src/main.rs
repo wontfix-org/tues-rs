@@ -12,7 +12,7 @@ extern crate whoami;
 extern crate subprocess;
 extern crate rpassword;
 extern crate filedescriptor;
-extern crate task_queue;
+extern crate scoped_threadpool;
 
 
 fn auth(host: &str, login_user: &str, sess: &ssh2::Session) -> Result<bool, ssh2::Error> {
@@ -192,7 +192,7 @@ fn main() {
     let (opts, rest) = rustop::opts! {
         synopsis "TUES!";
         opt parallel:bool, desc:"Run multiple commands in parallel";
-        opt num_threads:usize=10,
+        opt num_threads:u32=10,
             desc:"Number of concurrent threads to use for parallel execution";
         opt login_user:String=whoami::username(),
             desc:"Default username to connect with";
@@ -223,13 +223,15 @@ fn main() {
     ).collect();
 
     if opts.parallel {
-        let mut queue = task_queue::TaskQueue::with_threads(1, opts.num_threads);
-        for task in tasks {
-            queue.enqueue(move || {
-                run_task(task.clone()).unwrap(); 
-            }).unwrap();
-        }
-        queue.stop_wait();
+        let mut pool = scoped_threadpool::Pool::new(opts.num_threads);
+        pool.scoped(|scope| {
+            for task in tasks {
+                scope.execute(move || {
+                    run_task(task.clone()).unwrap(); 
+                });
+            }
+
+        });
     } else {
         for task in tasks {
             run_task(task).unwrap();
