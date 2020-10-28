@@ -45,9 +45,9 @@ fn proxy_io(src: &mut ssh2::Stream, dst: &mut dyn io::Write) {
 }
 
 
-struct PrefixWriter {
+struct PrefixWriter<'a> {
     base: Box<dyn io::Write>,
-    prefix: String,
+    prefix: &'a str,
     // On the first write, we need to add a prefix and remember we did...
     initially_prefixed: bool,
     // We add a prefix on every new line, so *after* a \n, but we can't
@@ -59,7 +59,7 @@ struct PrefixWriter {
 }
 
 
-impl io::Write for PrefixWriter {
+impl<'a> io::Write for PrefixWriter<'a> {
 
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         let mut size: usize = 0;
@@ -87,8 +87,8 @@ impl io::Write for PrefixWriter {
 }
 
 
-impl PrefixWriter {
-    fn new(base: Box<dyn io::Write>, prefix: String) -> PrefixWriter {
+impl<'a> PrefixWriter<'a> {
+    fn new(base: Box<dyn io::Write>, prefix: &str) -> PrefixWriter {
         PrefixWriter {
             base: base,
             prefix: prefix,
@@ -142,8 +142,8 @@ fn connect(host: &str, port: u32) -> Result<ssh2::Session, ssh2::Error> {
 
 fn run_task(task: Task) -> Result<(), ssh2::Error> {
     let prefix = String::from(format!("[{}]: ", task.host));
-    let mut stdout = PrefixWriter::new(Box::new(io::stdout()), prefix.clone());
-    let mut stderr = PrefixWriter::new(Box::new(io::stderr()), prefix.clone());
+    let mut stdout = PrefixWriter::new(Box::new(io::stdout()), &prefix);
+    let mut stderr = PrefixWriter::new(Box::new(io::stderr()), &prefix);
     let sess = connect(&task.host, task.port).unwrap();
     assert!(auth(&task.host, &task.login_user, &sess).unwrap());
     run(&sess, &task.command, &mut stdout, &mut stderr).unwrap();
