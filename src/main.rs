@@ -17,6 +17,15 @@ extern crate crossterm_cursor;
 extern crate scoped_threadpool;
 
 
+fn connect(host: &str, port: u32) -> Result<ssh2::Session, ssh2::Error> {
+    let tcp = TcpStream::connect(format!("{}:{}", host, port)).unwrap();
+    let mut sess = ssh2::Session::new().unwrap();
+    sess.set_tcp_stream(tcp);
+    sess.handshake().unwrap();
+    return Ok(sess);
+}
+
+
 fn auth(host: &str, login_user: &str, sess: &ssh2::Session) -> Result<bool, ssh2::Error> {
     match sess.userauth_agent(&login_user) {
         Ok(v) => v,
@@ -32,24 +41,9 @@ fn auth(host: &str, login_user: &str, sess: &ssh2::Session) -> Result<bool, ssh2
 }
 
 
-fn proxy_io(src: &mut ssh2::Stream, dst: &mut dyn io::Write, mut buf: &mut [u8]) -> Result<usize, io::Error> {
-    buf.iter_mut().for_each(|m| *m = 0);
-    match src.read(&mut buf) {
-        Ok(size) => {
-            if size != 0 {
-                dst.write_all(&buf[..size])?;
-            }
-            return Ok(size);
-        }
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(0),
-        Err(e) => return Err(e),
-    }
-}
-
-
-struct PrefixWriter<'a> {
+struct PrefixWriter {
     base: Box<dyn io::Write>,
-    prefix: &'a str,
+    prefix: String,
     // On the first write, we need to add a prefix and remember we did...
     initially_prefixed: bool,
     // We add a prefix on every new line, so *after* a \n, but we can't
@@ -61,7 +55,7 @@ struct PrefixWriter<'a> {
 }
 
 
-impl<'a> io::Write for PrefixWriter<'a> {
+impl io::Write for PrefixWriter {
 
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         let mut size: usize = 0;
@@ -89,8 +83,8 @@ impl<'a> io::Write for PrefixWriter<'a> {
 }
 
 
-impl<'a> PrefixWriter<'a> {
-    fn new(base: Box<dyn io::Write>, prefix: &str) -> PrefixWriter {
+impl PrefixWriter {
+    fn new(base: Box<dyn io::Write>, prefix: String) -> PrefixWriter {
         PrefixWriter {
             base: base,
             prefix: prefix,
@@ -102,15 +96,15 @@ impl<'a> PrefixWriter<'a> {
 
 
 trait ProxyIO {
-    fn proxy(&self, session: &ssh2::Session, channel: &mut ssh2::Channel) -> Result<(), ssh2::Error>;
+    fn stdout(&mut self) -> &mut Box<dyn io::Write>;
+    fn stderr(&mut self) -> &mut Box<dyn io::Write>;
+    fn prompt_password(&self, prompt: &str) -> String;
 }
 
 
-struct TerminalIOProxy<'a> {
-    prefix: &'a str,
-    errprefix: &'a str,
-    pattern: &'a str,
-    password: Arc<Mutex<Option<String>>>,
+struct TerminalIOProxy {
+    stdout: Box<dyn io::Write>,
+    stderr: Box<dyn io::Write>,
 }
 
 
@@ -125,106 +119,124 @@ fn buf_endswith(buf: &[u8], len: usize, s: &str) -> bool {
 
 }
 
-impl<'a> ProxyIO for TerminalIOProxy<'a> {
+impl ProxyIO for TerminalIOProxy {
 
-    fn proxy(&self, session: &ssh2::Session, mut channel: &mut ssh2::Channel) -> Result<(), ssh2::Error> {
-        let mut buf = [0u8; 1024];
-        let mut bytes_read: usize;
-        let mut attempts = 0;
+    fn stdout(&mut self) -> &mut Box<dyn io::Write> {
+        return &mut self.stdout;
+    }
 
-        session.set_blocking(false);
-        let mut pfd = [filedescriptor::pollfd {
-            fd: session.as_raw_fd(),
-            events: filedescriptor::POLLIN,
-            revents: 0,
-        }];
+    fn stderr(&mut self) -> &mut Box<dyn io::Write> {
+        return &mut self.stderr;
+    }
 
-        let mut stdout_src = channel.stream(0);
-        let mut stderr_src = channel.stderr();
-        let mut stdout = PrefixWriter::new(Box::new(io::stdout()), self.prefix);
-        let mut stderr = PrefixWriter::new(Box::new(io::stderr()), self.errprefix);
-
-        loop {
-            filedescriptor::poll(&mut pfd, None).ok();
-
-            proxy_io(&mut stdout_src, &mut stdout, &mut buf).unwrap();
-            bytes_read = proxy_io(&mut stderr_src, &mut stderr, &mut buf).unwrap();
-
-            if buf_endswith(&buf, bytes_read, &self.pattern) {
-                self.handle_password_prompt(&mut channel, attempts > 0).unwrap();
-                attempts += 1;
-                stderr.write(b"\n").unwrap();
-            }
-
-
-            if channel.eof() {
-                break;
-            }
-        }
-
-        session.set_blocking(true);
-        return Ok(());
+    fn prompt_password(&self, prompt: &str) -> String {
+        let cursor = crossterm_cursor::TerminalCursor::new();
+        cursor.save_position().unwrap();
+        let result = rpassword::read_password_from_tty(Some(prompt)).unwrap();
+        cursor.restore_position().unwrap();
+        return result;
     }
 }
 
 
-impl<'a> TerminalIOProxy<'a> {
-    fn new(prefix: &'a str, errprefix: &'a str, pattern: &'a str, password: Arc<Mutex<Option<String>>>) -> TerminalIOProxy<'a> {
-        return TerminalIOProxy { prefix: &prefix, errprefix: &errprefix, pattern: &pattern, password: password };
+impl TerminalIOProxy {
+    fn new(stdout: Box<dyn io::Write>, stderr: Box<dyn io::Write>) -> TerminalIOProxy {
+        return TerminalIOProxy { stdout: stdout, stderr: stderr };
     }
 
-    fn handle_password_prompt(&self, channel: &mut ssh2::Channel, reset: bool) -> Result<(), ssh2::Error> {
-        let mut pwguard = self.password.lock().unwrap(); 
-        let mut pwoption = pwguard.clone();
+}
 
-        if reset || pwoption.is_none() {
-            let cursor = crossterm_cursor::TerminalCursor::new();
-            cursor.save_position().unwrap();
-            *pwguard = Some(rpassword::read_password_from_tty(Some("")).unwrap());
-            pwoption = pwguard.clone();
-            cursor.restore_position().unwrap();
-        }
 
-        if pwoption.is_some() {
-            channel.write(pwoption.unwrap().as_bytes()).unwrap();
-            channel.write(b"\n").unwrap();
+fn proxy_io(src: &mut ssh2::Stream, dst: &mut dyn io::Write, mut buf: &mut [u8]) -> Result<usize, io::Error> {
+    buf.iter_mut().for_each(|m| *m = 0);
+    match src.read(&mut buf) {
+        Ok(size) => {
+            if size != 0 {
+                dst.write_all(&buf[..size])?;
+            }
+            return Ok(size);
         }
-        return Ok(());
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(0),
+        Err(e) => return Err(e),
     }
 }
 
 
-fn run(sess: &ssh2::Session, command: &str, proxy: &dyn ProxyIO) -> Result<i32, ssh2::Error> {
+fn handle_password_prompt(channel: &mut ssh2::Channel, proxy: &dyn ProxyIO, password: &Arc<Mutex<Option<String>>>, reset: bool) -> Result<(), ssh2::Error> {
+    let mut pwguard = password.lock().unwrap(); 
+    let mut pwoption = pwguard.clone();
+
+    if reset || pwoption.is_none() {
+        *pwguard = Some(proxy.prompt_password(""));
+        pwoption = pwguard.clone();
+    }
+
+    if pwoption.is_some() {
+        channel.write(pwoption.unwrap().as_bytes()).unwrap();
+        channel.write(b"\n").unwrap();
+    }
+    return Ok(());
+}
+
+
+fn run(sess: &ssh2::Session, command: &str, proxy: &mut dyn ProxyIO, pattern: &str, password: &Arc<Mutex<Option<String>>>) -> Result<i32, ssh2::Error> {
     let mut channel = sess.channel_session()?;
+    let mut buf = [0u8; 1024];
+    let mut bytes_read: usize;
+    let mut attempts = 0;
+
     channel.exec(&command)?;
-    proxy.proxy(&sess, &mut channel).unwrap();
+
+    sess.set_blocking(false);
+    let mut pfd = [filedescriptor::pollfd {
+        fd: sess.as_raw_fd(),
+        events: filedescriptor::POLLIN,
+        revents: 0,
+    }];
+
+    let mut stdout_src = channel.stream(0);
+    let mut stderr_src = channel.stderr();
+    loop {
+        filedescriptor::poll(&mut pfd, None).ok();
+        proxy_io(&mut stdout_src, &mut proxy.stdout(), &mut buf).unwrap();
+        bytes_read = proxy_io(&mut stderr_src, proxy.stderr(), &mut buf).unwrap();
+
+        if buf_endswith(&buf, bytes_read, &pattern) {
+            handle_password_prompt(&mut channel, proxy, password, attempts > 0).unwrap();
+            attempts += 1;
+            proxy.stderr().write(b"\n").unwrap();
+        }
+
+
+        if channel.eof() {
+            break;
+        }
+    }
+
+    sess.set_blocking(true);
+
     channel.wait_close()?;
     return Ok(channel.exit_status()?);
 }
 
 
-fn connect(host: &str, port: u32) -> Result<ssh2::Session, ssh2::Error> {
-    let tcp = TcpStream::connect(format!("{}:{}", host, port)).unwrap();
-    let mut sess = ssh2::Session::new().unwrap();
-    sess.set_tcp_stream(tcp);
-    sess.handshake().unwrap();
-    return Ok(sess);
-}
-
-
 fn run_task(task: Task, password: Arc<Mutex<Option<String>>>) -> Result<(), ssh2::Error> {
-    let prefix = String::from(format!("[{}/stdout]: ", task.host));
-    let errprefix = String::from(format!("[{}/stderr]: ", task.host));
+    let stdout = PrefixWriter::new(Box::new(io::stdout()), format!("[{}/stdout]: ", task.host));
+    let stderr = PrefixWriter::new(Box::new(io::stderr()), format!("[{}/stderr]: ", task.host));
     let prompt = "sudo password: ";
-    let proxy = TerminalIOProxy::new(&prefix, &errprefix, &prompt, password);
+
+    let mut proxy = TerminalIOProxy::new(Box::new(stdout), Box::new(stderr));
     let sess = connect(&task.host, task.port).unwrap();
+
     auth(&task.host, &task.login_user, &sess).unwrap();
+
     if let Some(user) = &task.user {
         let cmd = format!("sudo -S -u '{}' -p '{}' '{}'", &user, &prompt, &task.command);
-        run(&sess, &cmd, &proxy).unwrap();
+        run(&sess, &cmd, &mut proxy, &prompt, &password).unwrap();
     } else {
-        run(&sess, &task.command, &proxy).unwrap();
+        run(&sess, &task.command, &mut proxy, &prompt, &password).unwrap();
     }
+
     return Ok(());
 }
 
