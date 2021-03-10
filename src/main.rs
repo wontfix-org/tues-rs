@@ -96,37 +96,26 @@ impl PrefixWriter {
 
 
 trait ProxyIO {
-    fn stdout(&mut self) -> &mut Box<dyn io::Write>;
-    fn stderr(&mut self) -> &mut Box<dyn io::Write>;
+    fn stdout(&mut self) -> &mut dyn io::Write;
+    fn stderr(&mut self) -> &mut dyn io::Write;
     fn prompt_password(&self, prompt: &str) -> String;
 }
 
 
-struct TerminalIOProxy {
-    stdout: Box<dyn io::Write>,
-    stderr: Box<dyn io::Write>,
+struct TerminalIOProxy<'a> {
+    stdout: &'a mut dyn io::Write,
+    stderr: &'a mut dyn io::Write,
 }
 
 
-fn buf_endswith(buf: &[u8], len: usize, s: &str) -> bool {
-    if len < s.len() {
-        return false;
-    }
-    if &buf[len - s.len() .. len] == s.as_bytes() {
-        return true;
-    }
-    return false
+impl<'a> ProxyIO for TerminalIOProxy<'a> {
 
-}
-
-impl ProxyIO for TerminalIOProxy {
-
-    fn stdout(&mut self) -> &mut Box<dyn io::Write> {
-        return &mut self.stdout;
+    fn stdout(&mut self) -> &mut dyn io::Write {
+        return self.stdout;
     }
 
-    fn stderr(&mut self) -> &mut Box<dyn io::Write> {
-        return &mut self.stderr;
+    fn stderr(&mut self) -> &mut dyn io::Write {
+        return self.stderr;
     }
 
     fn prompt_password(&self, prompt: &str) -> String {
@@ -139,11 +128,10 @@ impl ProxyIO for TerminalIOProxy {
 }
 
 
-impl TerminalIOProxy {
-    fn new(stdout: Box<dyn io::Write>, stderr: Box<dyn io::Write>) -> TerminalIOProxy {
+impl<'a> TerminalIOProxy<'a> {
+    fn new<'b>(stdout: &'b mut dyn io::Write, stderr: &'b mut dyn io::Write) -> TerminalIOProxy<'b> {
         return TerminalIOProxy { stdout: stdout, stderr: stderr };
     }
-
 }
 
 
@@ -179,6 +167,18 @@ fn handle_password_prompt(channel: &mut ssh2::Channel, proxy: &dyn ProxyIO, pass
 }
 
 
+fn buf_endswith(buf: &[u8], len: usize, s: &str) -> bool {
+    if len < s.len() {
+        return false;
+    }
+    if &buf[len - s.len() .. len] == s.as_bytes() {
+        return true;
+    }
+    return false
+
+}
+
+
 fn run(sess: &ssh2::Session, command: &str, proxy: &mut dyn ProxyIO, pattern: &str, password: &Arc<Mutex<Option<String>>>) -> Result<i32, ssh2::Error> {
     let mut channel = sess.channel_session()?;
     let mut buf = [0u8; 1024];
@@ -196,9 +196,10 @@ fn run(sess: &ssh2::Session, command: &str, proxy: &mut dyn ProxyIO, pattern: &s
 
     let mut stdout_src = channel.stream(0);
     let mut stderr_src = channel.stderr();
+
     loop {
         filedescriptor::poll(&mut pfd, None).ok();
-        proxy_io(&mut stdout_src, &mut proxy.stdout(), &mut buf).unwrap();
+        proxy_io(&mut stdout_src, proxy.stdout(), &mut buf).unwrap();
         bytes_read = proxy_io(&mut stderr_src, proxy.stderr(), &mut buf).unwrap();
 
         if buf_endswith(&buf, bytes_read, &pattern) {
@@ -221,11 +222,11 @@ fn run(sess: &ssh2::Session, command: &str, proxy: &mut dyn ProxyIO, pattern: &s
 
 
 fn run_task(task: Task, password: Arc<Mutex<Option<String>>>) -> Result<(), ssh2::Error> {
-    let stdout = PrefixWriter::new(Box::new(io::stdout()), format!("[{}/stdout]: ", task.host));
-    let stderr = PrefixWriter::new(Box::new(io::stderr()), format!("[{}/stderr]: ", task.host));
+    let mut stdout = PrefixWriter::new(Box::new(io::stdout()), format!("[{}/stdout]: ", task.host));
+    let mut stderr = PrefixWriter::new(Box::new(io::stderr()), format!("[{}/stderr]: ", task.host));
     let prompt = "sudo password: ";
 
-    let mut proxy = TerminalIOProxy::new(Box::new(stdout), Box::new(stderr));
+    let mut proxy = TerminalIOProxy::new(&mut stdout, &mut stderr);
     let sess = connect(&task.host, task.port).unwrap();
 
     auth(&task.host, &task.login_user, &sess).unwrap();
